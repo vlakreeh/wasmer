@@ -30,6 +30,13 @@ pub struct Metering<F: Fn(&Operator) -> u64 + Copy + Clone + Send + Sync> {
 
     /// The global index in the current module for remaining points.
     remaining_points_index: Mutex<Option<GlobalIndex>>,
+
+    /// The global index in the current module for a boolean indicating whether points are exhausted
+    /// or not.
+    /// This boolean is represented as a i32 global:
+    ///   * 0: there are remaining points
+    ///   * 1: points have been exhausted
+    points_exhausted_index: Mutex<Option<GlobalIndex>>,
 }
 
 /// The function-level metering middleware.
@@ -40,8 +47,21 @@ pub struct FunctionMetering<F: Fn(&Operator) -> u64 + Copy + Clone + Send + Sync
     /// The global index in the current module for remaining points.
     remaining_points_index: GlobalIndex,
 
+    /// The global index in the current module for a boolean indicating whether points are exhausted
+    /// or not.
+    /// This boolean is represented as a i32 global:
+    ///   * 0: there are remaining points
+    ///   * 1: points have been exhausted
+    points_exhausted_index: GlobalIndex,
+
     /// Accumulated cost of the current basic block.
     accumulated_cost: u64,
+}
+
+#[derive(Debug, PartialEq)]
+pub enum MeteringPoints {
+    Remaining(u64),
+    Exhausted,
 }
 
 impl<F: Fn(&Operator) -> u64 + Copy + Clone + Send + Sync> Metering<F> {
@@ -51,6 +71,7 @@ impl<F: Fn(&Operator) -> u64 + Copy + Clone + Send + Sync> Metering<F> {
             initial_limit,
             cost_function,
             remaining_points_index: Mutex::new(None),
+            points_exhausted_index: Mutex::new(None),
         }
     }
 }
@@ -61,6 +82,7 @@ impl<F: Fn(&Operator) -> u64 + Copy + Clone + Send + Sync> fmt::Debug for Meteri
             .field("initial_limit", &self.initial_limit)
             .field("cost_function", &"<function>")
             .field("remaining_points_index", &self.remaining_points_index)
+            .field("points_exhausted_index", &self.points_exhausted_index)
             .finish()
     }
 }
@@ -73,7 +95,10 @@ impl<F: Fn(&Operator) -> u64 + Copy + Clone + Send + Sync + 'static> ModuleMiddl
         Box::new(FunctionMetering {
             cost_function: self.cost_function,
             remaining_points_index: self.remaining_points_index.lock().unwrap().expect(
-                "Metering::generate_function_middleware: Remaining points index not set up.",
+                "Metering::generate_function_middleware: remaining_points_index not set up.",
+            ),
+            points_exhausted_index: self.points_exhausted_index.lock().unwrap().expect(
+                "Metering::generate_function_middleware: points_exhausted_index not set up.",
             ),
             accumulated_cost: 0,
         })
@@ -82,22 +107,39 @@ impl<F: Fn(&Operator) -> u64 + Copy + Clone + Send + Sync + 'static> ModuleMiddl
     /// Transforms a `ModuleInfo` struct in-place. This is called before application on functions begins.
     fn transform_module_info(&self, module_info: &mut ModuleInfo) {
         let mut remaining_points_index = self.remaining_points_index.lock().unwrap();
-        if remaining_points_index.is_some() {
+        let mut points_exhausted_index = self.points_exhausted_index.lock().unwrap();
+
+        if remaining_points_index.is_some() || points_exhausted_index.is_some() {
             panic!("Metering::transform_module_info: Attempting to use a `Metering` middleware from multiple modules.");
         }
 
         // Append a global for remaining points and initialize it.
-        let global_index = module_info
+        let remaining_points_global_index = module_info
             .globals
             .push(GlobalType::new(Type::I64, Mutability::Var));
-        *remaining_points_index = Some(global_index.clone());
+        *remaining_points_index = Some(remaining_points_global_index.clone());
+
         module_info
             .global_initializers
             .push(GlobalInit::I64Const(self.initial_limit as i64));
 
         module_info.exports.insert(
-            "remaining_points".to_string(),
-            ExportIndex::Global(global_index),
+            "wasmer_metering_remaining_points".to_string(),
+            ExportIndex::Global(remaining_points_global_index),
+        );
+
+        // Append a global for the exhausted points boolean and initialize it.
+        let points_exhausted_global_index = module_info
+            .globals
+            .push(GlobalType::new(Type::I32, Mutability::Var));
+        *points_exhausted_index = Some(points_exhausted_global_index.clone());
+        module_info
+            .global_initializers
+            .push(GlobalInit::I32Const(0));
+
+        module_info.exports.insert(
+            "wasmer_metering_points_exhausted".to_string(),
+            ExportIndex::Global(points_exhausted_global_index),
         );
     }
 }
@@ -107,6 +149,7 @@ impl<F: Fn(&Operator) -> u64 + Copy + Clone + Send + Sync> fmt::Debug for Functi
         f.debug_struct("FunctionMetering")
             .field("cost_function", &"<function>")
             .field("remaining_points_index", &self.remaining_points_index)
+            .field("points_exhausted_index", &self.points_exhausted_index)
             .finish()
     }
 }
@@ -143,7 +186,9 @@ impl<F: Fn(&Operator) -> u64 + Copy + Clone + Send + Sync> FunctionMiddleware
                         Operator::I64Const { value: self.accumulated_cost as i64 },
                         Operator::I64LtU,
                         Operator::If { ty: WpTypeOrFuncType::Type(WpType::EmptyBlockType) },
-                        Operator::Unreachable, // FIXME: Signal the error properly.
+                        Operator::I32Const { value: 1 },
+                        Operator::GlobalSet { global_index: self.points_exhausted_index.as_u32() },
+                        Operator::Unreachable,
                         Operator::End,
 
                         // globals[remaining_points_index] -= self.accumulated_cost;
@@ -173,14 +218,28 @@ impl<F: Fn(&Operator) -> u64 + Copy + Clone + Send + Sync> FunctionMiddleware
 ///
 /// The instance Module must have been processed with the [`Metering`] middleware
 /// at compile time, otherwise this will panic.
-pub fn get_remaining_points(instance: &Instance) -> u64 {
-    instance
+pub fn get_remaining_points(instance: &Instance) -> MeteringPoints {
+    let exhausted: i32 = instance
         .exports
-        .get_global("remaining_points")
-        .expect("Can't get `remaining_points` from Instance")
+        .get_global("wasmer_metering_points_exhausted")
+        .expect("Can't get `wasmer_metering_points_exhausted` from Instance")
         .get()
         .try_into()
-        .expect("`remaining_points` from Instance has wrong type")
+        .expect("`wasmer_metering_points_exhausted` from Instance has wrong type");
+
+    if exhausted > 0 {
+        return MeteringPoints::Exhausted;
+    }
+
+    let points = instance
+        .exports
+        .get_global("wasmer_metering_remaining_points")
+        .expect("Can't get `wasmer_metering_remaining_points` from Instance")
+        .get()
+        .try_into()
+        .expect("`wasmer_metering_remaining_points` from Instance has wrong type");
+
+    MeteringPoints::Remaining(points)
 }
 
 /// Set the provided remaining points in an `Instance`.
@@ -195,10 +254,17 @@ pub fn get_remaining_points(instance: &Instance) -> u64 {
 pub fn set_remaining_points(instance: &Instance, points: u64) {
     instance
         .exports
-        .get_global("remaining_points")
-        .expect("Can't get `remaining_points` from Instance")
+        .get_global("wasmer_metering_remaining_points")
+        .expect("Can't get `wasmer_metering_remaining_points` from Instance")
         .set(points.into())
-        .expect("Can't set `remaining_points` in Instance");
+        .expect("Can't set `wasmer_metering_remaining_points` in Instance");
+
+    instance
+        .exports
+        .get_global("wasmer_metering_points_exhausted")
+        .expect("Can't get `wasmer_metering_points_exhausted` from Instance")
+        .set(0.into())
+        .expect("Can't set `wasmer_metering_points_exhausted` in Instance");
 }
 
 #[cfg(test)]
@@ -242,7 +308,10 @@ mod tests {
 
         // Instantiate
         let instance = Instance::new(&module, &imports! {}).unwrap();
-        assert_eq!(get_remaining_points(&instance), 10);
+        assert_eq!(
+            get_remaining_points(&instance),
+            MeteringPoints::Remaining(10)
+        );
 
         // First call
         //
@@ -257,17 +326,21 @@ mod tests {
             .native::<i32, i32>()
             .unwrap();
         add_one.call(1).unwrap();
-        assert_eq!(get_remaining_points(&instance), 6);
+        assert_eq!(
+            get_remaining_points(&instance),
+            MeteringPoints::Remaining(6)
+        );
 
         // Second call
         add_one.call(1).unwrap();
-        assert_eq!(get_remaining_points(&instance), 2);
+        assert_eq!(
+            get_remaining_points(&instance),
+            MeteringPoints::Remaining(2)
+        );
 
         // Third call fails due to limit
         assert!(add_one.call(1).is_err());
-        // TODO: what do we expect now? 0 or 2? See https://github.com/wasmerio/wasmer/issues/1931
-        // assert_eq!(metering.get_remaining_points(&instance), 2);
-        // assert_eq!(metering.get_remaining_points(&instance), 0);
+        assert_eq!(get_remaining_points(&instance), MeteringPoints::Exhausted);
     }
 
     #[test]
@@ -280,7 +353,10 @@ mod tests {
 
         // Instantiate
         let instance = Instance::new(&module, &imports! {}).unwrap();
-        assert_eq!(get_remaining_points(&instance), 10);
+        assert_eq!(
+            get_remaining_points(&instance),
+            MeteringPoints::Remaining(10)
+        );
         let add_one = instance
             .exports
             .get_function("add_one")
@@ -293,10 +369,31 @@ mod tests {
 
         // Ensure we can use the new points now
         add_one.call(1).unwrap();
-        assert_eq!(get_remaining_points(&instance), 8);
+        assert_eq!(
+            get_remaining_points(&instance),
+            MeteringPoints::Remaining(8)
+        );
+
         add_one.call(1).unwrap();
-        assert_eq!(get_remaining_points(&instance), 4);
+        assert_eq!(
+            get_remaining_points(&instance),
+            MeteringPoints::Remaining(4)
+        );
+
         add_one.call(1).unwrap();
-        assert_eq!(get_remaining_points(&instance), 0);
+        assert_eq!(
+            get_remaining_points(&instance),
+            MeteringPoints::Remaining(0)
+        );
+
+        assert!(add_one.call(1).is_err());
+        assert_eq!(get_remaining_points(&instance), MeteringPoints::Exhausted);
+
+        // Add some points for another call
+        set_remaining_points(&instance, 4);
+        assert_eq!(
+            get_remaining_points(&instance),
+            MeteringPoints::Remaining(4)
+        );
     }
 }
