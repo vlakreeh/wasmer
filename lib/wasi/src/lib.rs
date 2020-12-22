@@ -76,6 +76,18 @@ impl WasiEnv {
         ))
     }
 
+    pub fn import_object_from_version(
+        &mut self,
+        module: &Module,
+        wasi_version: WasiVersion,
+    ) -> Result<ImportObject, WasiError> {
+        Ok(generate_import_object_from_env(
+            module.store(),
+            self.clone(),
+            wasi_version,
+        ))
+    }
+
     /// Get the WASI state
     ///
     /// Be careful when using this in host functions that call into Wasm:
